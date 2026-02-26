@@ -17,27 +17,26 @@ from config import (
     MODEL_NAME, LOAD_IN_4BIT, MAX_SEQ_LENGTH, LORA_RANK,
     MAX_STEPS, NUM_GENERATIONS, BATCH_SIZE, GRAD_ACCUM,
     LEARNING_RATE, WARMUP_RATIO, MAX_GRAD_NORM, GPU_MEMORY_UTIL,
+    REASONING_START, REASONING_END, SOLUTION_START, SOLUTION_END
 )
 
 load_dotenv()
 HF_TOKEN    = os.environ["HF_TOKEN"]
 HF_USERNAME = os.environ["HF_USERNAME"]
 
-# Structured reasoning system prompt (FIX 7: actual newlines, not \\n literals)
-SYSTEM_PROMPT = """Respond in the following format:
-<reasoning>
-...
-</reasoning>
-<answer>
-...
-</answer>"""
+# NEW: Structured reasoning system prompt based on Unsloth Qwen3_MoE notebook
+SYSTEM_PROMPT = f"""You are given a problem.
+Think about the problem and provide your working out.
+Place it between {REASONING_START} and {REASONING_END}.
+Then, provide your solution between {SOLUTION_START}{SOLUTION_END}"""
 
 
-def extract_xml_answer(text: str) -> str:
-    if "<answer>" not in text:
+def extract_custom_answer(text: str) -> str:
+    """Extracts answer using the new <SOLUTION> formatting"""
+    if SOLUTION_START not in text:
         return ""
-    ans = text.split("<answer>")[-1]
-    return ans.split("</answer>")[0].strip() if "</answer>" in ans else ans.strip()
+    ans = text.split(SOLUTION_START)[-1]
+    return ans.split(SOLUTION_END)[0].strip() if SOLUTION_END in ans else ans.strip()
 
 
 def get_reward_functions(target_lang: str, answer_lookup: dict):
@@ -45,8 +44,8 @@ def get_reward_functions(target_lang: str, answer_lookup: dict):
         rewards = []
         for prompt, completion in zip(prompts, completions):
             text    = completion[0]["content"] if isinstance(completion, list) else completion
-            pred    = extract_xml_answer(text)
-            p_text  = str(prompt[-1]["content"]) if isinstance(prompt, list) else str(prompt)  # FIX 8
+            pred    = extract_custom_answer(text)
+            p_text  = str(prompt[-1]["content"]) if isinstance(prompt, list) else str(prompt)
             correct = answer_lookup.get(p_text, "")
             try:
                 ok = abs(float(pred) - float(correct)) < 1e-6
@@ -56,7 +55,8 @@ def get_reward_functions(target_lang: str, answer_lookup: dict):
         return rewards
 
     def format_reward(completions, **kwargs) -> list[float]:
-        pattern = r"^<reasoning>.*?</reasoning>\s*<answer>.*?</answer>$"
+        # Expecting: <start_working_out>...<end_working_out><SOLUTION>...</SOLUTION>
+        pattern = rf"^{REASONING_START}.*?{REASONING_END}\s*{SOLUTION_START}.*?{SOLUTION_END}$"
         rewards = []
         for comp in completions:
             text = comp[0]["content"] if isinstance(comp, list) else comp
@@ -95,30 +95,37 @@ if __name__ == "__main__":
     dataset_name   = f"{HF_USERNAME}/multilingual-reasoning-{args.lang}"
     q_key          = f"question_{args.lang}"
 
-    # ── 1. Load model (FIX 9: explicit dtype=bfloat16 for full-precision H100)
+    # ── 1. Load model 
     print(f"🦥 Loading {args.model} in bfloat16 (H100)...")
+    # Note: Qwen3-30B-A3B is very large. fast_inference=False is set in the 
+    # official notebook because it is "Not supported for MoE (yet!)"
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name           = args.model,
         max_seq_length       = MAX_SEQ_LENGTH,
         load_in_4bit         = LOAD_IN_4BIT,
-        dtype                = torch.bfloat16,     # FIX 9
-        fast_inference       = True,
+        dtype                = torch.bfloat16,
+        fast_inference       = False,               # NEW: MoE fast inference not supported yet
         max_lora_rank        = LORA_RANK,
         gpu_memory_utilization = GPU_MEMORY_UTIL,
     )
 
+    # Custom Chat Template mapping to our Reasoning/Solution tags
+    chat_template = """{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] + eos_token }}{% set loop_messages = messages[1:] %}{% else %}{{ '""" + SYSTEM_PROMPT + """' + eos_token }}{% set loop_messages = messages %}{% endif %}{% for message in loop_messages %}{% if message['role'] == 'user' %}{{ message['content'] }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '""" + REASONING_START + """' }}{% endif %}"""
+    tokenizer.chat_template = chat_template
+
     model = FastLanguageModel.get_peft_model(
         model,
         r                        = LORA_RANK,
+        # NEW: target_modules updated to include MoE specific layers per Unsloth guide
         target_modules           = ["q_proj", "k_proj", "v_proj", "o_proj",
-                                    "gate_proj", "up_proj", "down_proj"],
-        lora_alpha               = LORA_RANK,
+                                    "gate_proj", "up_proj", "down_proj", "gate_up_proj"],
+        lora_alpha               = LORA_RANK * 2,   # *2 speeds up training per notebook
         lora_dropout             = 0,
-        use_gradient_checkpointing = "unsloth",
+        use_gradient_checkpointing = True,          # Changed from "unsloth" to True per notebook
         random_state             = 42,
+        bias                     = "none",
     )
 
-    # FIX 10: clear cache before vLLM initializes
     torch.cuda.empty_cache()
 
     # ── 2. Load dataset from HF Hub
@@ -128,7 +135,7 @@ if __name__ == "__main__":
     formatted_data = []
 
     for item in raw_data:
-        q   = str(item.get(q_key, ""))   # FIX 8: force str, avoid Arrow type issues
+        q   = str(item.get(q_key, ""))
         ans = str(item.get("answer_number", ""))
         if q and ans:
             formatted_data.append({
@@ -148,9 +155,9 @@ if __name__ == "__main__":
         output_dir                   = f"outputs_{args.lang}",
         learning_rate                = LEARNING_RATE,
         lr_scheduler_type            = "cosine",
-        optim                        = "adamw_torch_fused",   # FIX 11: faster on H100
-        warmup_ratio                 = WARMUP_RATIO,          # FIX 13
-        max_grad_norm                = MAX_GRAD_NORM,         # FIX 12: 0.1 for GRPO stability
+        optim                        = "adamw_torch_fused",
+        warmup_steps                 = 5,                     # Replaced warmup_ratio per notebook
+        max_grad_norm                = MAX_GRAD_NORM,
         logging_steps                = 5,
         per_device_train_batch_size  = BATCH_SIZE,
         gradient_accumulation_steps  = GRAD_ACCUM,
@@ -160,7 +167,7 @@ if __name__ == "__main__":
         max_steps                    = args.steps,
         save_steps                   = 250,
         report_to                    = "none",
-        use_vllm                     = True,
+        use_vllm                     = False,                 # Disabled because fast_inference is False for MoE
     )
 
     trainer = GRPOTrainer(

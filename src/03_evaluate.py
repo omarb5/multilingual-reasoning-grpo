@@ -15,18 +15,26 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import BASELINE_MODEL, NUM_TEST_SAMPLES, PROVIDER
+from config import BASELINE_MODEL, NUM_TEST_SAMPLES, PROVIDER, REASONING_START, REASONING_END, SOLUTION_START, SOLUTION_END
 
 load_dotenv()
 HF_TOKEN    = os.environ["HF_TOKEN"]
 HF_USERNAME = os.environ["HF_USERNAME"]
 
+# NEW: Structured reasoning system prompt
+SYSTEM_PROMPT = f"""You are given a problem.
+Think about the problem and provide your working out.
+Place it between {REASONING_START} and {REASONING_END}.
+Then, provide your solution between {SOLUTION_START}{SOLUTION_END}"""
 
-# FIX 15: correct regex for \boxed — single backslash in raw string
+
 def extract_answer(text: str) -> str:
-    if "<answer>" in text:
-        ans = text.split("<answer>")[-1]
-        return ans.split("</answer>")[0].strip() if "</answer>" in ans else ans.strip()
+    """Extracts answer using the new <SOLUTION> formatting"""
+    if SOLUTION_START in text:
+        ans = text.split(SOLUTION_START)[-1]
+        return ans.split(SOLUTION_END)[0].strip() if SOLUTION_END in ans else ans.strip()
+    
+    # Fallbacks if format fails
     for pat in [r"####\s*([+-]?\d+\.?\d*)", r"\\boxed\{([^}]+)\}"]:
         m = re.search(pat, text)
         if m:
@@ -73,21 +81,24 @@ if __name__ == "__main__":
     )
     FastLanguageModel.for_inference(model)
 
-    sys_prompt  = "Respond in the following format:\n<reasoning>\n...\n</reasoning>\n<answer>\n...\n</answer>"
+    # Custom Chat Template mapping to our Reasoning/Solution tags
+    chat_template = """{% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] + eos_token }}{% set loop_messages = messages[1:] %}{% else %}{{ '""" + SYSTEM_PROMPT + """' + eos_token }}{% set loop_messages = messages %}{% endif %}{% for message in loop_messages %}{% if message['role'] == 'user' %}{{ message['content'] }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '""" + REASONING_START + """' }}{% endif %}"""
+    tokenizer.chat_template = chat_template
+
     grpo_results = []
 
     for item in tqdm(test_problems, desc="GRPO"):
         prompt   = str(item[q_key])
         true_ans = str(item["answer_number"])
-        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt}]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
         text     = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs   = tokenizer([text], return_tensors="pt").to("cuda")
         outputs  = model.generate(
             **inputs,
             max_new_tokens = 1024,
-            do_sample      = True,                          # FIX 16: required for temperature to take effect
+            do_sample      = True,                          
             temperature    = 0.6,
-            pad_token_id   = tokenizer.eos_token_id,        # FIX 17: avoid padding warning
+            pad_token_id   = tokenizer.eos_token_id,        
         )
         resp = tokenizer.decode(outputs[0], skip_special_tokens=True)[len(text):].strip()
         pred = extract_answer(resp)
@@ -97,7 +108,7 @@ if __name__ == "__main__":
             "correct": is_correct(pred, true_ans),
         })
 
-    # ── 3. Evaluate baseline via HF Inference Providers (FIX 18: --baseline arg)
+    # ── 3. Evaluate baseline via HF Inference Providers 
     print(f"\n🌐 Evaluating baseline [{args.baseline}] via HF Inference API...")
     client       = InferenceClient(api_key=HF_TOKEN)
     base_results = []
@@ -108,7 +119,7 @@ if __name__ == "__main__":
         try:
             resp = client.chat.completions.create(
                 model    = args.baseline,
-                messages = [{"role": "user", "content": prompt}],
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
                 max_tokens  = 1024,
                 temperature = 0.6,
                 provider    = PROVIDER,
@@ -137,7 +148,7 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.bar([f"Baseline\n({args.baseline.split('/')[-1]})", "GRPO Trained"],
            [base_acc, grpo_acc], color=["#94a3b8", "#38bdf8"])
-    ax.set_title(f"Qwen3.5 Reasoning — {args.lang.title()}")
+    ax.set_title(f"Qwen3 MoE Reasoning — {args.lang.title()}")
     ax.set_ylim([0, 1.0])
     for i, v in enumerate([base_acc, grpo_acc]):
         ax.text(i, v + 0.02, f"{v:.1%}", ha="center", fontweight="bold")
