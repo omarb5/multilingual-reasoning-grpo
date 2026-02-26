@@ -2,11 +2,15 @@
 
 This repository contains a full end-to-end pipeline for training and evaluating multilingual reasoning models using GRPO (Group Relative Policy Optimization). 
 
-It is designed for high-end hardware (e.g., NVIDIA H100) and integrates deeply with the Hugging Face ecosystem (Datasets Hub, Inference Providers, Model Hub).
+Based on the [official Unsloth Qwen3 MoE guides](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Qwen3_MoE.ipynb), this repository utilizes **Qwen3-30B-A3B-Instruct-2507**—a 30B parameter Mixture of Experts (MoE) model with 3B active parameters—optimized for execution on high-end hardware (e.g., NVIDIA H100).
 
 ## Architecture
-- **Data Prep**: Collects English math/science problems (GSM8K, MATH, ARC), translates them via Hugging Face Inference Providers (using Qwen3-235B), and pushes the datasets to your Hugging Face account.
-- **Training**: Uses `unsloth` and `trl` to run GRPO on an H100 GPU. Optimizations include `bfloat16` precision (no 4-bit quantization), vLLM for fast generation, larger sequence lengths (`2048`), and `NUM_GENERATIONS=8`.
+- **Data Prep**: Collects English math/science problems (GSM8K, MATH), translates them via Hugging Face Inference Providers (using Qwen3-235B), and pushes the datasets to your Hugging Face account.
+- **Training**: Uses `unsloth` and `trl` to run GRPO on an H100 GPU. Optimizations include:
+  - Custom Chat Templates injecting `<start_working_out>` and `<SOLUTION>` tokens.
+  - `bfloat16` precision (no 4-bit quantization).
+  - Target modules explicitly mapped for MoE routing layers (`gate_proj`, `up_proj`, `down_proj`, `gate_up_proj`).
+  - Lora Rank 32 mapped to Unsloth guidelines.
 - **Evaluation**: Compares the GRPO-trained model (loaded locally from HF Hub) against a baseline via the HF Inference API.
 
 ## Setup
