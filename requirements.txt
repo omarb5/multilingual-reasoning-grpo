@@ -1,12 +1,34 @@
+# ============================================================
+# requirements.txt
+# Version pins match the Unsloth Feb-2026 release:
+#   transformers==5.1.0 + trl==0.27.1 are the latest verified pair.
+# DO NOT upgrade without testing — GRPOTrainer API changes between versions.
+# ============================================================
+
+# Unsloth — always install from git for latest MoE Triton kernel fixes
 unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
-vllm
-trl
-datasets
-huggingface_hub
+
+# Pinned core deps (from Unsloth Feb-2026 release notes)
+transformers==5.1.0
+trl==0.27.1
+datasets==4.3.0
+"huggingface_hub>=0.34.0"
+
+# Required for Qwen3 tokenizer
+sentencepiece
+protobuf
+
+# Training & evaluation utilities
 torch
 torchvision
 pillow
 matplotlib
 pandas
+numpy
 tqdm
 python-dotenv
+
+# NOTE: vllm is NOT installed.
+# MoE fast_inference is not yet supported, so use_vllm=False in training.
+# If you later switch to a dense model with fast_inference=True, add:
+#   pip install vllm
